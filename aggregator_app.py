@@ -149,19 +149,40 @@ class DynamicSubscriptionFinder:
 
         subscriptions = self.extract_subscriptions_from_content(content)
         if subscriptions:
-            with self.lock: self._log_status(f"  => 從 {file_url} 找到 {len(subscriptions)} 個連結。")
+            # 使用鎖確保線程安全地更新日誌
+            with self.lock:
+                self._log_status(f"  => 從 {file_url} 找到 {len(subscriptions)} 個連結。")
         return subscriptions
 
+    # --- 關鍵改動 ---
     def extract_subscriptions_from_content(self, content):
+        """
+        修正了從文本內容中提取訂閱鏈接的邏輯。
+        之前的版本錯誤地處理 re.findall 的結果，導致只提取到鏈接的第一個字符。
+        此版本參考了原始專案的邏輯，直接使用 findall 返回的完整鏈接列表。
+        """
         if not content: return []
+        
+        # 1. 標準訂閱格式 (v2board, sspanel 等)
         sub_regex = r"https?://(?:[a-zA-Z0-9\u4e00-\u9fa5\-]+\.)+[a-zA-Z0-9\u4e00-\u9fa5\-]+(?:(?:(?:/index.php)?/api/v1/client/subscribe\?token=[a-zA-Z0-9]{16,32})|(?:/link/[a-zA-Z0-9]+\?(?:sub|mu|clash)=\d)|(?:/(?:s|sub)/[a-zA-Z0-9]{32}))"
+        
+        # 2. 其他常見的轉換 API 格式
         extra_regex = r"https?://(?:[a-zA-Z0-9\u4e00-\u9fa5\-]+\.)+[a-zA-Z0-9\u4e00-\u9fa5\-]+/sub\?(?:\S+)?target=\S+"
-        protocal_regex = r"(?:vmess|trojan|ss|ssr|vless|hysteria|tuic)://[a-zA-Z0-9:.?+=@%&#_\-/]{10,}"
-        all_patterns = f"({sub_regex}|{extra_regex}|{protocal_regex})"; found_links = re.findall(all_patterns, content, re.I)
-        cleaned_links = set();
-        for link_tuple in found_links:
-            link = next((s for s in link_tuple if s), None)
-            if link: cleaned_links.add(link.strip())
+        
+        # 3. 節點本身協議的格式 (ss, vmess, etc.)
+        protocol_regex = r"(?:vmess|trojan|ss|ssr|vless|hysteria|tuic)://[a-zA-Z0-9:.?+=@%&#_\-/]{10,}"
+        
+        # 將所有模式組合在一起，不使用外部捕獲組
+        all_patterns = f"{sub_regex}|{extra_regex}|{protocol_regex}"
+        
+        # re.findall 在沒有捕獲組時，會返回一個包含所有匹配字符串的列表，這正是我們需要的。
+        # 例如: ['http://....', 'vmess://....']
+        # 舊代碼的問題在於 post-processing a list of strings as a list of tuples.
+        found_links = re.findall(all_patterns, content, re.I)
+        
+        # 使用集合(set)來自動去重，然後轉換回列表
+        cleaned_links = {link.strip() for link in found_links if link}
+        
         return list(cleaned_links)
 
     def find(self, executor, github_token, queries, pages):
@@ -192,7 +213,9 @@ class DynamicSubscriptionFinder:
         future_to_url = {executor.submit(self.fetch_and_extract_from_url, url): url for url in potential_files}
         for i, future in enumerate(as_completed(future_to_url)):
             if self.stop_event.is_set(): break
-            self._log_status(f"進度: {i+1}/{len(potential_files)}")
+            # 為了避免日誌刷屏太快，可以考慮有條件地打印進度
+            if (i+1) % 10 == 0 or i+1 == len(potential_files):
+                self._log_status(f"提取進度: {i+1}/{len(potential_files)}")
             try:
                 subscriptions = future.result()
                 if subscriptions:
@@ -254,7 +277,7 @@ class RealProxyAggregator:
 class AggregatorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("代理聚合器 v1.9.0 (並發版)")
+        self.root.title("代理聚合器 v1.9.1 (並發修正版)")
         self.root.geometry("850x850")
         
         self.result_queue = queue.Queue()
@@ -370,12 +393,12 @@ class AggregatorApp:
         self.log_to_gui("\n正在發送中止信號... 請等待當前任務完成。")
         self.stop_search_event.set()
         if self.executor:
-            # Python 3.9+ feature, but harmless on older versions. It tries to cancel scheduled futures.
-            self.executor.shutdown(wait=False, cancel_futures=True)
+            # This is a good-faith attempt to stop threads.
+            self.executor.shutdown(wait=False, cancel_futures=True if sys.version_info >= (3, 9) else False)
         self.stop_search_button.config(state='disabled')
 
     def search_and_populate(self):
-        self.executor = ThreadPoolExecutor(max_workers=20) # 可以調整並發數
+        self.executor = ThreadPoolExecutor(max_workers=20)
         try:
             github_token = self.github_token_entry.get().strip()
             if "（" in github_token: github_token = ""
@@ -402,7 +425,7 @@ class AggregatorApp:
                 self.log_to_gui("\n搜索任務已由用戶手動中止。")
             elif found_links:
                 self.log_to_gui(f"\n將 {len(found_links)} 個連結填入訂閱連結欄...")
-                unique_links = sorted(list(set(found_links))) # 排序並去重
+                unique_links = sorted(list(set(found_links)))
                 def update_text(): self.sub_links_text.delete('1.0', tk.END); self.sub_links_text.insert('1.0', "\n".join(unique_links))
                 self.root.after(0, update_text)
             else:
@@ -411,7 +434,8 @@ class AggregatorApp:
         except Exception as e:
             self.log_to_gui(f"搜索過程中發生嚴重錯誤: {e}\n{traceback.format_exc()}")
         finally:
-            self.executor.shutdown(wait=False)
+            if self.executor:
+                self.executor.shutdown(wait=False)
             self.executor = None
             self.root.after(0, self.set_buttons_state, False)
 
@@ -433,8 +457,7 @@ class AggregatorApp:
             self.log_to_gui("=== 開始聚合處理 ===")
             all_nodes = []
             
-            # 聚合過程也可以並發
-            with ThreadPoolExecutor(max_workers=10) as executor:
+            with ThreadPoolExecutor(max_workers=20) as executor:
                 future_to_url = {executor.submit(self.aggregator.fetch_and_parse_url, url, proxy_address): url for url in urls}
                 for future in as_completed(future_to_url):
                     try:
