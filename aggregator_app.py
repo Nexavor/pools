@@ -10,7 +10,6 @@
 import tkinter as tk
 from tkinter import scrolledtext, messagebox, ttk, filedialog
 import base64
-import random
 import time
 import threading
 import requests
@@ -18,15 +17,10 @@ import sys
 import certifi
 import json
 import re
-import os
 import traceback
 import urllib.parse
-import urllib.request
-from collections import defaultdict
-import itertools
-import ssl
-import queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import queue
 
 # 為了支援SOCKS代理，需要安裝 PySocks
 try:
@@ -76,41 +70,31 @@ class TextWidgetContextMenu:
 class NexavorUtils:
     USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
     DEFAULT_HTTP_HEADERS = {"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9"}
-    CTX = ssl.create_default_context(); CTX.check_hostname = False; CTX.verify_mode = ssl.CERT_NONE
     @staticmethod
-    def isurl(url): return url.startswith('http://') or url.startswith('https://')
-    @staticmethod
-    def trim(text: str) -> str:
-        if not text or not isinstance(text, str): return ""
-        return text.strip()
-    @staticmethod
-    def http_get(url, headers=None, params=None, retry=3, proxy=None, timeout=15, trace=False):
-        if not NexavorUtils.isurl(url): return ""
+    def http_get(url, headers=None, params=None, retry=3, proxy=None, timeout=15):
+        if not (url.startswith('http://') or url.startswith('https://')): return ""
         if retry <= 0: return ""
         headers = headers if headers else NexavorUtils.DEFAULT_HTTP_HEADERS
         proxies = {'http': proxy, 'https': proxy} if proxy else None
         try:
-            full_url = url
-            if params: full_url += '?' + urllib.parse.urlencode(params)
-            response = requests.get(full_url, headers=headers, proxies=proxies, timeout=timeout, verify=certifi.where())
+            response = requests.get(url, headers=headers, params=params, proxies=proxies, timeout=timeout, verify=certifi.where())
             response.raise_for_status()
             return response.text
-        except Exception as e:
-            if trace: print(f"請求失敗: {url}, 原因: {e}")
+        except Exception:
             time.sleep(1)
-            return NexavorUtils.http_get(url, headers, params, retry - 1, proxy, timeout, trace)
+            return NexavorUtils.http_get(url, headers, params, retry - 1, proxy, timeout)
 
 # --- 整合後的並發搜索核心 ---
 class DynamicSubscriptionFinder:
-    def __init__(self, status_callback=None, proxy_address=None, stop_event=None, lock=None):
-        self.status_callback = status_callback
+    def __init__(self, gui_queue, proxy_address=None, stop_event=None, lock=None):
+        self.gui_queue = gui_queue
         self.proxy_address = proxy_address
         self.utils = NexavorUtils()
         self.stop_event = stop_event or threading.Event()
         self.lock = lock or threading.Lock()
 
     def _log_status(self, message):
-        if self.status_callback: self.status_callback(message)
+        self.gui_queue.put(('log', message))
 
     def search_github_for_keyword(self, token, search_query, pages=2):
         if self.stop_event.is_set(): return []
@@ -122,9 +106,10 @@ class DynamicSubscriptionFinder:
         for page in range(1, pages + 1):
             if self.stop_event.is_set(): self._log_status(f"[並發搜索] 關鍵字 '{search_query}' 的任務已中止。"); break
             
-            api_url = f"https://api.github.com/search/code?q={urllib.parse.quote(search_query)}&sort=indexed&order=desc&per_page=100&page={page}"
+            params = {'q': search_query, 'sort': 'indexed', 'order': 'desc', 'per_page': 100, 'page': page}
+            api_url = "https://api.github.com/search/code"
             try:
-                content = self.utils.http_get(api_url, headers=headers, proxy=self.proxy_address)
+                content = self.utils.http_get(api_url, params=params, headers=headers, proxy=self.proxy_address)
                 if not content: continue
                 data = json.loads(content)
                 items = data.get("items", [])
@@ -155,127 +140,115 @@ class DynamicSubscriptionFinder:
 
     def extract_subscriptions_from_content(self, content):
         if not content: return []
-        
-        sub_regex = r"https?://(?:[a-zA-Z0-9\u4e00-\u9fa5\-]+\.)+[a-zA-Z0-9\u4e00-\u9fa5\-]+(?:(?:(?:/index.php)?/api/v1/client/subscribe\?token=[a-zA-Z0-9]{16,32})|(?:/link/[a-zA-Z0-9]+\?(?:sub|mu|clash)=\d)|(?:/(?:s|sub)/[a-zA-Z0-9]{32}))"
-        
-        # --- Bug修復: 將 "httpshttps?" 改為 "https?" ---
-        extra_regex = r"https?://(?:[a-zA-Z0-9\u4e00-\u9fa5\-]+\.)+[a-zA-Z0-9\u4e00-\u9fa5\-]+/sub\?(?:\S+)?target=\S+"
-        
-        protocol_regex = r"(?:vmess|trojan|ss|ssr|vless|hysteria|tuic)://[a-zA-Z0-9:.?+=@%&#_\-/]{10,}"
-        
-        all_patterns = f"({sub_regex}|{extra_regex}|{protocol_regex})"
-        found_links = re.findall(all_patterns, content, re.I)
-        
         cleaned_links = set()
-        for link_tuple in found_links:
-            # The result from findall with capture groups is a list of tuples.
-            # We need to find the non-empty string in each tuple.
-            link = next((s for s in link_tuple if s), None)
-            if link:
-                cleaned_links.add(link.strip())
-                
-        return list(cleaned_links)
+        sub_regex = r"https?://(?:[a-zA-Z0-9\u4e00-\u9fa5\-]+\.)+[a-zA-Z0-9\u4e00-\u9fa5\-]+(?:(?:(?:/index.php)?/api/v1/client/subscribe\?token=[a-zA-Z0-9]{16,32})|(?:/link/[a-zA-Z0-9]+\?(?:sub|mu|clash)=\d)|(?:/(?:s|sub)/[a-zA-Z0-9]{32}))"
+        extra_regex = r"https?://(?:[a-zA-Z0-9\u4e00-\u9fa5\-]+\.)+[a-zA-Z0-9\u4e00-\u9fa5\-]+/sub\?(?:\S+)?target=\S+"
+        protocol_regex = r"(?:vmess|trojan|ss|ssr|vless|hysteria|tuic)://[a-zA-Z0-9:.?+=@%&#_\-/]{10,}"
+        cleaned_links.update(re.findall(sub_regex, content, re.I))
+        cleaned_links.update(re.findall(extra_regex, content, re.I))
+        cleaned_links.update(re.findall(protocol_regex, content, re.I))
+        return [link.strip() for link in cleaned_links]
 
     def find(self, executor, github_token, queries, pages):
-        all_found_subscriptions = set()
         potential_files = set()
-
         self._log_status(f"=== 第一階段: 開始並發搜索 {len(queries)} 個關鍵字 ===")
-        if not github_token: self._log_status("[GitHub搜索] 警告：未提供 GitHub Token，搜索請求受到嚴格限制。")
+        if not github_token: self._log_status("[GitHub搜索] 警告：未提供 GitHub Token，請求可能受限。")
 
         future_to_query = {executor.submit(self.search_github_for_keyword, github_token, f'"{query}" in:file', pages): query for query in queries}
         for future in as_completed(future_to_query):
             if self.stop_event.is_set(): break
-            try:
-                urls = future.result()
-                potential_files.update(urls)
-            except Exception as e:
-                self._log_status(f"一個關鍵字搜索任務失敗: {e}")
+            try: potential_files.update(future.result())
+            except Exception as e: self._log_status(f"一個關鍵字搜索任務失敗: {e}")
         
-        if self.stop_event.is_set(): self._log_status("搜索已中止。"); return []
-
+        if self.stop_event.is_set(): return
+        
         self._log_status(f"\n=== 第二階段: 從 {len(potential_files)} 個文件中並發提取訂閱連結... ===")
-        if not potential_files:
-            self._log_status("未找到任何可能的文件，任務結束。")
-            return []
+        if not potential_files: self._log_status("未找到任何可能的文件。"); return
             
         future_to_url = {executor.submit(self.fetch_and_extract_from_url, url): url for url in potential_files}
         for i, future in enumerate(as_completed(future_to_url)):
             if self.stop_event.is_set(): break
-            if (i + 1) % 10 == 0 or (i + 1) == len(potential_files):
+            if (i + 1) % 20 == 0 or (i + 1) == len(potential_files):
                 self._log_status(f"提取進度: {i+1}/{len(potential_files)}")
             try:
                 subscriptions = future.result()
-                if subscriptions:
-                    with self.lock:
-                        all_found_subscriptions.update(subscriptions)
-            except Exception as e:
-                self._log_status(f"一個文件提取任務失敗: {e}")
-
-        if self.stop_event.is_set(): self._log_status("提取已中止。")
-        
-        self._log_status(f"\n搜索完成！總共找到 {len(all_found_subscriptions)} 個不重複的訂閱連結。"); return list(all_found_subscriptions)
+                if subscriptions: self.gui_queue.put(('found_links', subscriptions))
+            except Exception as e: self._log_status(f"一個文件提取任務失敗: {e}")
 
 # --- 後端處理核心 ---
 class RealProxyAggregator:
-    def __init__(self, status_callback=None):
-        self.status_callback = status_callback
-    def _log_status(self, message):
-        if self.status_callback: self.status_callback(message)
-    def fetch_and_parse_url(self, url, proxy_address=None):
-        self._log_status(f"正在從 {url} 獲取內容...")
-        headers = {'User-Agent': 'Clash/1.11.0'}
-        proxies = {'http': proxy_address, 'https': proxy_address} if proxy_address else None
-        if proxy_address: self._log_status(f"  (使用代理: {proxy_address})")
-        else: self._log_status("  (未使用代理)")
-        try:
-            response = requests.get(url, headers=headers, proxies=proxies, timeout=15, verify=certifi.where())
-            response.raise_for_status()
-            raw_content = response.text
-            self._log_status("內容下載成功，正在嘗試解析...")
-            try: decoded_content = base64.b64decode(raw_content.strip()).decode('utf-8'); self._log_status("Base64 解碼成功。")
-            except (base64.binascii.Error, UnicodeDecodeError): self._log_status("非 Base64 編碼，視為純文字格式。"); decoded_content = raw_content
-            nodes = [node.strip() for node in decoded_content.splitlines() if node.strip()]
-            self._log_status(f"成功解析出 {len(nodes)} 個節點。"); return nodes
-        except requests.exceptions.ProxyError as e: self._log_status(f"錯誤：代理連線失敗。\n原因: {e}"); return[]
-        except requests.exceptions.SSLError as e: self._log_status(f"錯誤：SSL 連線失敗。\n原因: {e}"); return []
-        except requests.exceptions.RequestException as e: self._log_status(f"錯誤：無法從 {url} 獲取內容。\n原因: {e}"); return []
-        except Exception as e: self._log_status(f"處理 {url} 時發生未知錯誤: {e}"); return []
-    
-    def filter_and_sort_nodes(self, nodes):
-        self._log_status("\n正在對節點進行去重...")
-        if not nodes: self._log_status("沒有節點可供處理。"); return []
-        original_count = len(nodes)
-        unique_nodes = list(dict.fromkeys(nodes))
-        new_count = len(unique_nodes)
-        self._log_status(f"去重完成。從 {original_count} 個節點中，保留了 {new_count} 個唯一節點。")
-        return unique_nodes
+    def __init__(self, gui_queue):
+        self.gui_queue = gui_queue
 
-    def generate_final_subscription(self, nodes, chunk_size=256):
-        self._log_status("\n正在生成最終的通用訂閱檔案...")
-        if not nodes: self._log_status("沒有節點可供生成訂閱。"); return
-        full_content = "\n".join(nodes)
+    def _log(self, msg): self.gui_queue.put(('log', msg))
+
+    def fetch_and_parse_url(self, url, proxy_address=None):
+        self._log(f"正在從 {url} 獲取內容...")
+        try:
+            raw_content = NexavorUtils.http_get(url, proxy=proxy_address)
+            if not raw_content: raise ValueError("下載內容為空")
+            self._log(f"內容下載成功 ({len(raw_content)} 字節)，正在解析...")
+            try:
+                decoded_content = base64.b64decode(raw_content.strip()).decode('utf-8')
+                self._log("  -> Base64 解碼成功。")
+            except Exception:
+                decoded_content = raw_content
+                self._log("  -> 非 Base64 編碼，視為純文字。")
+            
+            nodes = [node.strip() for node in decoded_content.splitlines() if node.strip()]
+            self._log(f"成功解析出 {len(nodes)} 個節點。")
+            return nodes
+        except Exception as e:
+            self._log(f"錯誤：處理 {url} 失敗。\n原因: {e}")
+            return []
+    
+    def process_all_urls(self, executor, urls, proxy_address):
+        all_nodes = []
+        self._log("=== 開始並發聚合處理 ===")
+        future_to_url = {executor.submit(self.fetch_and_parse_url, url, proxy_address): url for url in urls}
+        for future in as_completed(future_to_url):
+            try:
+                nodes_from_url = future.result()
+                if nodes_from_url: all_nodes.extend(nodes_from_url)
+            except Exception as e: self._log(f"一個聚合任務失敗: {e}")
+        
+        self._log(f"\n總共獲取 {len(all_nodes)} 個初始節點。")
+        self._log("正在對節點進行去重...")
+        unique_nodes = list(dict.fromkeys(all_nodes))
+        self._log(f"去重完成，保留了 {len(unique_nodes)} 個唯一節點。")
+        
+        self._log("\n正在生成最終的通用訂閱檔案...")
+        if not unique_nodes: self._log("沒有節點可供生成訂閱。"); return
+        
+        full_content = "\n".join(unique_nodes)
         encoded_content = base64.b64encode(full_content.encode('utf-8')).decode('utf-8')
-        self._log_status("訂閱檔案生成完畢！開始以流式輸出...")
+        
+        self._log("訂閱檔案生成完畢！開始以流式輸出到結果框...")
+        chunk_size=512
         for i in range(0, len(encoded_content), chunk_size):
-            yield encoded_content[i:i + chunk_size]
-            time.sleep(0.005)
+            self.gui_queue.put(('result_chunk', encoded_content[i:i + chunk_size]))
+            time.sleep(0.01)
 
 # --- 圖形化介面 (GUI) ---
 class AggregatorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("代理聚合器 v1.9.2 (Regex修正版)")
+        self.root.title("代理聚合器 v1.9.5")
         self.root.geometry("850x850")
         
-        self.result_queue = queue.Queue()
+        self.gui_queue = queue.Queue()
         self.stop_search_event = threading.Event()
         self.thread_lock = threading.Lock()
         self.executor = None
+        self.found_links = set()
         
-        self.aggregator = RealProxyAggregator(status_callback=self.log_to_gui)
+        self.aggregator = RealProxyAggregator(self.gui_queue)
         
-        main_frame = ttk.Frame(root, padding="10")
+        self._setup_ui()
+        self.process_gui_queue()
+
+    def _setup_ui(self):
+        main_frame = ttk.Frame(self.root, padding="10")
         main_frame.pack(fill="both", expand=True)
         main_frame.columnconfigure(0, weight=1); main_frame.rowconfigure(4, weight=1); main_frame.rowconfigure(5, weight=1)
 
@@ -291,7 +264,7 @@ class AggregatorApp:
         ttk.Label(search_frame, text="搜索關鍵字 (,):").grid(row=1, column=0, padx=(0, 10), pady=(5, 5), sticky='w')
         self.search_query_entry = ttk.Entry(search_frame)
         self.search_query_entry.grid(row=1, column=1, columnspan=2, sticky="ew", pady=(5, 5))
-        self.search_query_entry.insert(tk.END, "clash, quantumultx,v2ray,sub,SSR,vmess,trojan,vless")
+        self.search_query_entry.insert(tk.END, "clash,quantumultx,v2ray,sub,SSR,vmess,trojan,vless")
 
         ttk.Label(search_frame, text="搜索頁數 (1-10):").grid(row=2, column=0, padx=(0, 10), pady=(5, 0), sticky='w')
         self.pages_spinbox = ttk.Spinbox(search_frame, from_=1, to=10, width=5)
@@ -302,7 +275,7 @@ class AggregatorApp:
         search_buttons_frame.grid(row=0, column=3, rowspan=3, padx=(15, 0), sticky='ns')
         self.search_button = ttk.Button(search_buttons_frame, text="開始並發搜索", command=self.run_search_thread)
         self.search_button.pack(fill='x', expand=True, ipady=5)
-        self.stop_search_button = ttk.Button(search_buttons_frame, text="中止搜索", command=self.stop_search, state='disabled')
+        self.stop_search_button = ttk.Button(search_buttons_frame, text="中止任務", command=self.stop_task, state='disabled')
         self.stop_search_button.pack(fill='x', expand=True, ipady=5, pady=(5,0))
         
         sub_frame = ttk.LabelFrame(main_frame, text="訂閱連結 (一行一個)", padding="5")
@@ -330,149 +303,150 @@ class AggregatorApp:
         ttk.Label(result_header, text="通用訂閱格式 (Base64)").pack(side='left', anchor='nw')
         self.result_text = scrolledtext.ScrolledText(result_frame, wrap=tk.WORD); self.result_text.pack(fill='both', expand=True)
 
-        self.setup_context_menus()
+        self._setup_context_menus()
 
-    def setup_context_menus(self):
-        TextWidgetContextMenu(self.github_token_entry); TextWidgetContextMenu(self.search_query_entry)
-        TextWidgetContextMenu(self.sub_links_text); TextWidgetContextMenu(self.proxy_entry); TextWidgetContextMenu(self.result_text)
+    def _setup_context_menus(self):
+        TextWidgetContextMenu(self.github_token_entry)
+        TextWidgetContextMenu(self.search_query_entry)
+        TextWidgetContextMenu(self.sub_links_text)
+        TextWidgetContextMenu(self.proxy_entry)
+        TextWidgetContextMenu(self.result_text)
 
-    def log_to_gui(self, message):
-        self.root.after(0, self._append_log, message)
+    def process_gui_queue(self):
+        try:
+            while not self.gui_queue.empty():
+                msg_type, data = self.gui_queue.get_nowait()
+                if msg_type == 'log':
+                    self._append_log(data)
+                elif msg_type == 'found_links':
+                    self.found_links.update(data)
+                elif msg_type == 'result_chunk':
+                    self._append_result(data)
+                elif msg_type == 'task_done':
+                    was_stopped = self.stop_search_event.is_set()
+                    self.set_buttons_state(is_running=False)
+
+                    if data == 'search':
+                        if self.found_links:
+                            self._update_sub_links_text()
+                            if was_stopped:
+                                self._append_log(f"\n>>> 搜索已中止。已將找到的 {len(self.found_links)} 個連結輸出到上方。<<<")
+                            else:
+                                self._append_log(f"\n>>> 搜索完成，已將 {len(self.found_links)} 個連結填入上方。請點擊「執行聚合處理」。<<<")
+                        elif was_stopped:
+                            self._append_log("\n>>> 搜索已中止，未找到任何連結。<<<")
+                        # 如果是正常完成但沒找到，日誌已在工作線程中打印
+                        
+                    elif data == 'process':
+                        if was_stopped:
+                            self._append_log("\n=== 聚合處理已中止 ===")
+                        else:
+                            self._append_log("\n=== 聚合處理完成 ===")
+        finally:
+            self.root.after(100, self.process_gui_queue)
 
     def _append_log(self, message):
-        self.log_text.config(state='normal'); self.log_text.insert(tk.END, message + "\n")
-        self.log_text.config(state='disabled'); self.log_text.see(tk.END)
+        self.log_text.config(state='normal')
+        self.log_text.insert(tk.END, message + "\n")
+        self.log_text.config(state='disabled')
+        self.log_text.see(tk.END)
 
-    def set_buttons_state(self, is_searching):
-        if is_searching:
-            self.search_button.config(state='disabled')
-            self.stop_search_button.config(state='normal')
-            self.run_button.config(state='disabled')
-        else:
-            self.search_button.config(state='normal')
-            self.stop_search_button.config(state='disabled')
-            self.run_button.config(state='normal')
+    def _append_result(self, chunk):
+        self.result_text.insert(tk.END, chunk)
+        self.result_text.see(tk.END)
 
-    def process_result_queue(self):
-        try:
-            for _ in range(5):
-                chunk = self.result_queue.get_nowait()
-                if chunk is None:
-                    self.log_to_gui("\n=== 處理完成 ===")
-                    self.run_button.config(state='normal')
-                    return
-                else:
-                    self.result_text.insert(tk.END, chunk)
-            self.result_text.see(tk.END)
-        except queue.Empty:
-            pass
-        self.root.after(20, self.process_result_queue)
+    def _update_sub_links_text(self):
+        self.sub_links_text.delete('1.0', tk.END)
+        self.sub_links_text.insert('1.0', "\n".join(sorted(list(self.found_links))))
+
+    def set_buttons_state(self, is_running):
+        state = 'disabled' if is_running else 'normal'
+        self.search_button.config(state=state)
+        self.run_button.config(state=state)
+        self.stop_search_button.config(state='normal' if is_running else 'disabled')
+
+    def start_task(self, target_func, task_name):
+        self.set_buttons_state(is_running=True)
+        self._append_log(f"--- {task_name}任務開始 ---")
+        
+        self.stop_search_event.clear()
+        self.executor = ThreadPoolExecutor(max_workers=20)
+        
+        thread = threading.Thread(target=target_func, daemon=True)
+        thread.start()
 
     def run_search_thread(self):
-        self.stop_search_event.clear()
-        self.set_buttons_state(is_searching=True)
+        self.log_text.config(state='normal'); self.log_text.delete('1.0', tk.END); self.log_text.config(state='disabled')
+        self.sub_links_text.delete('1.0', tk.END)
+        self.result_text.delete('1.0', tk.END)
+        self.found_links.clear()
+        self.start_task(self._search_worker, "搜索")
+
+    def run_processing_thread(self):
         self.log_text.config(state='normal'); self.log_text.delete('1.0', tk.END); self.log_text.config(state='disabled')
         self.result_text.delete('1.0', tk.END)
-        self.sub_links_text.delete('1.0', tk.END)
-        thread = threading.Thread(target=self.search_and_populate, daemon=True)
-        thread.start()
-        
-    def stop_search(self):
-        self.log_to_gui("\n正在發送中止信號... 請等待當前任務完成。")
+        self.start_task(self._processing_worker, "聚合")
+
+    def stop_task(self):
+        self._append_log("\n正在發送中止信號... 請等待當前線程結束。")
         self.stop_search_event.set()
         if self.executor:
+            # For Python 3.9+, this helps cancel futures that haven't started.
             self.executor.shutdown(wait=False, cancel_futures=True if sys.version_info >= (3, 9) else False)
         self.stop_search_button.config(state='disabled')
 
-    def search_and_populate(self):
-        self.executor = ThreadPoolExecutor(max_workers=20)
+    def _search_worker(self):
         try:
             github_token = self.github_token_entry.get().strip()
             if "（" in github_token: github_token = ""
-            
-            queries_str = self.search_query_entry.get().strip()
-            queries = [q.strip() for q in queries_str.split(',') if q.strip()]
-            
-            try: pages = int(self.pages_spinbox.get())
-            except ValueError: self.log_to_gui("錯誤：搜索頁數必須是有效整數。"); return
-                
-            if not queries: self.log_to_gui("錯誤：請至少輸入一個搜索關鍵字。"); return
-            
-            proxy_address = self.proxy_entry.get().strip() if self.proxy_enabled.get() else None
-            
-            finder = DynamicSubscriptionFinder(
-                status_callback=self.log_to_gui, 
-                proxy_address=proxy_address, 
-                stop_event=self.stop_search_event,
-                lock=self.thread_lock
-            )
-            found_links = finder.find(self.executor, github_token, queries, pages)
-            
-            if self.stop_search_event.is_set():
-                self.log_to_gui("\n搜索任務已由用戶手動中止。")
-            elif found_links:
-                self.log_to_gui(f"\n已將找到的 {len(found_links)} 個不重複連結填入下方文本框。")
-                self.log_to_gui(">>> 請檢查連結，然後點擊「執行聚合處理」按鈕來獲取節點。 <<<")
-                unique_links = sorted(list(set(found_links)))
-                def update_text(): self.sub_links_text.delete('1.0', tk.END); self.sub_links_text.insert('1.0', "\n".join(unique_links))
-                self.root.after(0, update_text)
-            else:
-                self.log_to_gui("\n未找到任何可用的訂閱連結。")
-            self.log_to_gui("\n=== 搜索結束 ===")
+            queries = [q.strip() for q in self.search_query_entry.get().strip().split(',') if q.strip()]
+            pages = int(self.pages_spinbox.get())
+            proxy = self.proxy_entry.get().strip() if self.proxy_enabled.get() else None
+
+            if not queries:
+                self.gui_queue.put(('log', "錯誤：請至少輸入一個搜索關鍵字。")); return
+
+            finder = DynamicSubscriptionFinder(self.gui_queue, proxy, self.stop_search_event, self.thread_lock)
+            finder.find(self.executor, github_token, queries, pages)
+
         except Exception as e:
-            self.log_to_gui(f"搜索過程中發生嚴重錯誤: {e}\n{traceback.format_exc()}")
+            self.gui_queue.put(('log', f"搜索過程中發生嚴重錯誤: {e}\n{traceback.format_exc()}"))
         finally:
-            if self.executor:
-                self.executor.shutdown(wait=False)
-            self.executor = None
-            self.root.after(0, self.set_buttons_state, False)
+            if self.executor: self.executor.shutdown()
+            self.gui_queue.put(('task_done', 'search'))
 
-    def run_processing_thread(self):
-        self.set_buttons_state(is_searching=True)
-        self.log_text.config(state='normal'); self.log_text.delete('1.0', tk.END); self.log_text.config(state='disabled')
-        self.result_text.delete('1.0', tk.END)
-        thread = threading.Thread(target=self.process_subscriptions, daemon=True)
-        thread.start()
-        self.process_result_queue()
-
-    def process_subscriptions(self):
+    def _processing_worker(self):
         try:
-            urls = self.sub_links_text.get('1.0', tk.END).strip().split('\n')
-            urls = [url.strip() for url in urls if url.strip()]
-            proxy_address = self.proxy_entry.get().strip() if self.proxy_enabled.get() else None
-            if not urls: self.log_to_gui("錯誤：請至少輸入一個訂閱連結。"); self.result_queue.put(None); return
+            urls = [u.strip() for u in self.sub_links_text.get('1.0', tk.END).strip().split('\n') if u.strip()]
+            proxy = self.proxy_entry.get().strip() if self.proxy_enabled.get() else None
 
-            self.log_to_gui("=== 開始並發聚合處理 ===")
-            all_nodes = []
-            
-            with ThreadPoolExecutor(max_workers=20) as executor:
-                future_to_url = {executor.submit(self.aggregator.fetch_and_parse_url, url, proxy_address): url for url in urls}
-                for future in as_completed(future_to_url):
-                    try:
-                        nodes_from_url = future.result()
-                        if nodes_from_url:
-                            all_nodes.extend(nodes_from_url)
-                    except Exception as e:
-                        self.log_to_gui(f"聚合一個連結時失敗: {e}")
+            if not urls:
+                self.gui_queue.put(('log', "錯誤：請至少輸入一個訂閱連結。")); return
 
-            self.log_to_gui(f"\n總共獲取 {len(all_nodes)} 個初始節點。")
-            unique_nodes = self.aggregator.filter_and_sort_nodes(all_nodes)
-            
-            for chunk in self.aggregator.generate_final_subscription(unique_nodes):
-                self.result_queue.put(chunk)
-            
+            self.aggregator.process_all_urls(self.executor, urls, proxy)
+
         except Exception as e:
-            self.log_to_gui(f"聚合過程中發生嚴重錯誤: {e}")
+            self.gui_queue.put(('log', f"聚合過程中發生嚴重錯誤: {e}\n{traceback.format_exc()}"))
         finally:
-            self.result_queue.put(None)
+            if self.executor: self.executor.shutdown()
+            self.gui_queue.put(('task_done', 'process'))
 
     def save_result_to_file(self):
         content = self.result_text.get('1.0', tk.END).strip()
-        if not content: messagebox.showwarning("內容為空", "沒有可以儲存的內容。"); return
-        file_path = filedialog.asksaveasfilename(title="儲存訂閱檔案", defaultextension=".txt", filetypes=[("文字檔案", "*.txt"), ("所有檔案", "*.*")])
+        if not content:
+            messagebox.showwarning("內容為空", "沒有可以儲存的內容。")
+            return
+        
+        file_path = filedialog.asksaveasfilename(
+            title="儲存訂閱檔案", 
+            defaultextension=".txt", 
+            filetypes=[("文字檔案", "*.txt"), ("所有檔案", "*.*")]
+        )
         if not file_path: return
+        
         try:
-            with open(file_path, 'w', encoding='utf-8') as f: f.write(content)
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(content)
             messagebox.showinfo("儲存成功", f"訂閱檔案已成功儲存至：\n{file_path}")
         except Exception as e:
             messagebox.showerror("儲存失敗", f"儲存檔案時發生錯誤：\n{e}")
