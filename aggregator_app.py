@@ -149,49 +149,39 @@ class DynamicSubscriptionFinder:
 
         subscriptions = self.extract_subscriptions_from_content(content)
         if subscriptions:
-            # 使用鎖確保線程安全地更新日誌
             with self.lock:
                 self._log_status(f"  => 從 {file_url} 找到 {len(subscriptions)} 個連結。")
         return subscriptions
 
-    # --- 關鍵改動 ---
     def extract_subscriptions_from_content(self, content):
-        """
-        修正了從文本內容中提取訂閱鏈接的邏輯。
-        之前的版本錯誤地處理 re.findall 的結果，導致只提取到鏈接的第一個字符。
-        此版本參考了原始專案的邏輯，直接使用 findall 返回的完整鏈接列表。
-        """
         if not content: return []
         
-        # 1. 標準訂閱格式 (v2board, sspanel 等)
         sub_regex = r"https?://(?:[a-zA-Z0-9\u4e00-\u9fa5\-]+\.)+[a-zA-Z0-9\u4e00-\u9fa5\-]+(?:(?:(?:/index.php)?/api/v1/client/subscribe\?token=[a-zA-Z0-9]{16,32})|(?:/link/[a-zA-Z0-9]+\?(?:sub|mu|clash)=\d)|(?:/(?:s|sub)/[a-zA-Z0-9]{32}))"
         
-        # 2. 其他常見的轉換 API 格式
+        # --- Bug修復: 將 "httpshttps?" 改為 "https?" ---
         extra_regex = r"https?://(?:[a-zA-Z0-9\u4e00-\u9fa5\-]+\.)+[a-zA-Z0-9\u4e00-\u9fa5\-]+/sub\?(?:\S+)?target=\S+"
         
-        # 3. 節點本身協議的格式 (ss, vmess, etc.)
         protocol_regex = r"(?:vmess|trojan|ss|ssr|vless|hysteria|tuic)://[a-zA-Z0-9:.?+=@%&#_\-/]{10,}"
         
-        # 將所有模式組合在一起，不使用外部捕獲組
-        all_patterns = f"{sub_regex}|{extra_regex}|{protocol_regex}"
-        
-        # re.findall 在沒有捕獲組時，會返回一個包含所有匹配字符串的列表，這正是我們需要的。
-        # 例如: ['http://....', 'vmess://....']
-        # 舊代碼的問題在於 post-processing a list of strings as a list of tuples.
+        all_patterns = f"({sub_regex}|{extra_regex}|{protocol_regex})"
         found_links = re.findall(all_patterns, content, re.I)
         
-        # 使用集合(set)來自動去重，然後轉換回列表
-        cleaned_links = {link.strip() for link in found_links if link}
-        
+        cleaned_links = set()
+        for link_tuple in found_links:
+            # The result from findall with capture groups is a list of tuples.
+            # We need to find the non-empty string in each tuple.
+            link = next((s for s in link_tuple if s), None)
+            if link:
+                cleaned_links.add(link.strip())
+                
         return list(cleaned_links)
 
     def find(self, executor, github_token, queries, pages):
         all_found_subscriptions = set()
         potential_files = set()
 
-        # --- 第一階段: 並發搜索關鍵字 ---
         self._log_status(f"=== 第一階段: 開始並發搜索 {len(queries)} 個關鍵字 ===")
-        if not github_token: self._log_status("[GitHub搜索] 警告：未提供 GitHub Token，搜索請求受到嚴格限制，可能很快失敗。")
+        if not github_token: self._log_status("[GitHub搜索] 警告：未提供 GitHub Token，搜索請求受到嚴格限制。")
 
         future_to_query = {executor.submit(self.search_github_for_keyword, github_token, f'"{query}" in:file', pages): query for query in queries}
         for future in as_completed(future_to_query):
@@ -204,7 +194,6 @@ class DynamicSubscriptionFinder:
         
         if self.stop_event.is_set(): self._log_status("搜索已中止。"); return []
 
-        # --- 第二階段: 並發獲取文件並提取 ---
         self._log_status(f"\n=== 第二階段: 從 {len(potential_files)} 個文件中並發提取訂閱連結... ===")
         if not potential_files:
             self._log_status("未找到任何可能的文件，任務結束。")
@@ -213,8 +202,7 @@ class DynamicSubscriptionFinder:
         future_to_url = {executor.submit(self.fetch_and_extract_from_url, url): url for url in potential_files}
         for i, future in enumerate(as_completed(future_to_url)):
             if self.stop_event.is_set(): break
-            # 為了避免日誌刷屏太快，可以考慮有條件地打印進度
-            if (i+1) % 10 == 0 or i+1 == len(potential_files):
+            if (i + 1) % 10 == 0 or (i + 1) == len(potential_files):
                 self._log_status(f"提取進度: {i+1}/{len(potential_files)}")
             try:
                 subscriptions = future.result()
@@ -277,7 +265,7 @@ class RealProxyAggregator:
 class AggregatorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("代理聚合器 v1.9.1 (並發修正版)")
+        self.root.title("代理聚合器 v1.9.2 (Regex修正版)")
         self.root.geometry("850x850")
         
         self.result_queue = queue.Queue()
@@ -393,7 +381,6 @@ class AggregatorApp:
         self.log_to_gui("\n正在發送中止信號... 請等待當前任務完成。")
         self.stop_search_event.set()
         if self.executor:
-            # This is a good-faith attempt to stop threads.
             self.executor.shutdown(wait=False, cancel_futures=True if sys.version_info >= (3, 9) else False)
         self.stop_search_button.config(state='disabled')
 
@@ -424,7 +411,8 @@ class AggregatorApp:
             if self.stop_search_event.is_set():
                 self.log_to_gui("\n搜索任務已由用戶手動中止。")
             elif found_links:
-                self.log_to_gui(f"\n將 {len(found_links)} 個連結填入訂閱連結欄...")
+                self.log_to_gui(f"\n已將找到的 {len(found_links)} 個不重複連結填入下方文本框。")
+                self.log_to_gui(">>> 請檢查連結，然後點擊「執行聚合處理」按鈕來獲取節點。 <<<")
                 unique_links = sorted(list(set(found_links)))
                 def update_text(): self.sub_links_text.delete('1.0', tk.END); self.sub_links_text.insert('1.0', "\n".join(unique_links))
                 self.root.after(0, update_text)
@@ -454,7 +442,7 @@ class AggregatorApp:
             proxy_address = self.proxy_entry.get().strip() if self.proxy_enabled.get() else None
             if not urls: self.log_to_gui("錯誤：請至少輸入一個訂閱連結。"); self.result_queue.put(None); return
 
-            self.log_to_gui("=== 開始聚合處理 ===")
+            self.log_to_gui("=== 開始並發聚合處理 ===")
             all_nodes = []
             
             with ThreadPoolExecutor(max_workers=20) as executor:
